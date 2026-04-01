@@ -126,17 +126,40 @@ def provisioner_allocate_stake():
     try:
         _pw_guard = get_password()
         if _pw_guard:
-            cap      = _fetch_capacity(_pw_guard)
-            headroom = _stake_headroom(cap)
-            if amount_dusk > headroom:
-                return jsonify({
-                    "ok": False,
-                    "stderr": (
-                        f"Operator capacity exceeded: "
-                        f"active={cap['active_current']:,.0f}/{cap['active_maximum']:,.0f} DUSK, "
-                        f"headroom={headroom:,.2f} DUSK, requested={amount_dusk:,.2f} DUSK."
-                    ),
-                }), 400
+            cap    = _fetch_capacity(_pw_guard)
+            # Look up current node status from stake cache
+            with _stake_cache_lock:
+                node_status = (_stake_cache.get(idx) or {}).get("status", "inactive")
+
+            if node_status == "active":
+                # Topping up an active node incurs a 10% slash penalty on the
+                # locked amount — cap by slash headroom / SLASH_RATE
+                SLASH_RATE = 0.10
+                slash_hdroom = max(0.0, cap.get("locked_maximum", 0.0) - cap.get("locked_current", 0.0))
+                max_allowed  = round(slash_hdroom / SLASH_RATE, 4) if SLASH_RATE > 0 else 0.0
+                if amount_dusk > max_allowed:
+                    return jsonify({
+                        "ok": False,
+                        "stderr": (
+                            f"Slash capacity exceeded for active node prov[{idx}]: "
+                            f"locked={cap['locked_current']:,.0f}/{cap['locked_maximum']:,.0f} DUSK, "
+                            f"max top-up={max_allowed:,.2f} DUSK (10% slash rate), "
+                            f"requested={amount_dusk:,.2f} DUSK."
+                        ),
+                    }), 400
+            else:
+                # Inactive/seeded/maturing — no slash penalty, limit is active_maximum
+                active_available = max(0.0, cap.get("active_maximum", 0.0) - cap.get("active_current", 0.0))
+                if amount_dusk > active_available:
+                    return jsonify({
+                        "ok": False,
+                        "stderr": (
+                            f"Operator active stake capacity exceeded for prov[{idx}] ({node_status}): "
+                            f"active={cap['active_current']:,.0f}/{cap['active_maximum']:,.0f} DUSK, "
+                            f"available={active_available:,.2f} DUSK, "
+                            f"requested={amount_dusk:,.2f} DUSK."
+                        ),
+                    }), 400
     except Exception:
         pass
 

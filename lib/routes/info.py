@@ -128,10 +128,10 @@ def sozu_balance_of():
     if not account:
         return jsonify({"ok": False, "stderr": "missing account"}), 400
 
-    from ..rues import _rues_node_host
-    base = _rues_node_host()
-    DRIVER    = f"{base}/on/driver:{CONTRACT_ID}"
-    CONTRACTS = f"{base}/on/contracts:{CONTRACT_ID}"
+    # Always use the configured state node for driver/contract calls —
+    # independent of which node the RUES WS is connected to
+    DRIVER    = f"{_NODE_STATE_URL}/on/driver:{CONTRACT_ID}"
+    CONTRACTS = f"{_NODE_STATE_URL}/on/contracts:{CONTRACT_ID}"
 
     def curl(url, body, ct="application/x-www-form-urlencoded"):
         r = subprocess.run(
@@ -159,10 +159,8 @@ def sozu_balance_of():
 
 @bp.route("/api/sozu/exchange_rate", methods=["GET", "POST"])
 def sozu_exchange_rate():
-    from ..rues import _rues_node_host
-    base = _rues_node_host()
-    DRIVER    = f"{base}/on/driver:{CONTRACT_ID}"
-    CONTRACTS = f"{base}/on/contracts:{CONTRACT_ID}"
+    DRIVER    = f"{_NODE_STATE_URL}/on/driver:{CONTRACT_ID}"
+    CONTRACTS = f"{_NODE_STATE_URL}/on/contracts:{CONTRACT_ID}"
 
     def curl(url, body, ct="application/x-www-form-urlencoded"):
         r = subprocess.run(
@@ -303,8 +301,12 @@ def network_tip():
 
 @bp.route("/api/provisioner/live", methods=["GET", "POST"])
 def provisioner_live():
-    """Live stake info for all provisioners + epoch countdown."""
+    """Live stake info + epoch from GraphQL tip + operator JSON stake-info."""
+    from ..assess import _assess_state_cached
     import urllib.request as _ur
+
+    pw = (request.get_json(silent=True) or {}).get("password", "")
+
     tip = None
     try:
         q   = '{ block(height: -1) { header { height } } }'
@@ -319,29 +321,31 @@ def provisioner_live():
     except Exception:
         tip = None
 
-    epoch                   = (tip // EPOCH_BLOCKS + 1)        if tip is not None else None
-    blocks_in_epoch         = (tip % EPOCH_BLOCKS)             if tip is not None else None
-    blocks_until_transition = (EPOCH_BLOCKS - blocks_in_epoch) if blocks_in_epoch is not None else None
+    st = _assess_state_cached(tip or 0, pw)
 
-    pw    = (request.get_json(silent=True) or {}).get("password", "")
+    si_epoch     = st.get("epoch")
+    si_remaining = st.get("remaining_blocks")
+    epoch    = si_epoch or ((tip // EPOCH_BLOCKS) + 1 if tip else None)
+    blk_left = si_remaining or (EPOCH_BLOCKS - (tip % EPOCH_BLOCKS) if tip else None)
+    blk_in   = (EPOCH_BLOCKS - blk_left) if blk_left is not None else None
+
     nodes = {}
     for idx in NODE_INDICES:
-        r    = wallet_cmd(f"--profile-idx {idx} stake-info", timeout=20, password=pw)
-        info = parse_stake_info(r.get("stdout", "") + r.get("stderr", ""), current_tip=tip or 0)
-        with _stake_cache_lock:
-            authoritative = (info["has_stake"]
-                             or "A stake does not exist" in (r.get("stdout", "") + r.get("stderr", "")))
-            if authoritative:
-                _stake_cache[idx] = {**info, "ok": r["ok"], "cached": False}
-            elif idx in _stake_cache:
-                info = dict(_stake_cache[idx])
-                info["cached"] = True
-        nodes[str(idx)] = {**info, "ok": r["ok"]}
+        node = st["by_idx"].get(idx)
+        if node:
+            nodes[str(idx)] = {**node, "ok": True, "cached": False}
+        else:
+            nodes[str(idx)] = {
+                "idx": idx, "status": "inactive", "ta": None,
+                "stake_dusk": 0.0, "locked_dusk": 0.0, "reward_dusk": 0.0,
+                "eligibility_block": None, "eligibility_epoch": None,
+                "has_stake": False, "ok": True, "cached": False,
+            }
 
     return jsonify({
         "tip": tip, "epoch": epoch,
-        "blocks_in_epoch": blocks_in_epoch,
-        "blocks_until_transition": blocks_until_transition,
+        "blocks_in_epoch": blk_in,
+        "blocks_until_transition": blk_left,
         "epoch_blocks": EPOCH_BLOCKS,
         "nodes": nodes,
     })
