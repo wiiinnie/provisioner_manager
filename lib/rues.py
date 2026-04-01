@@ -1,484 +1,475 @@
 """
-rues.py — RUES WebSocket thread, event log, decode, and local node WS monitors.
+rues.py — RUES WebSocket event stream.
 
-Owns:
-  _event_log, _event_log_lock       — shared with routes/actions.py via _get_event_log()
-  _RUES_WS_URL, _RUES_SESSION_ID    — runtime-mutable
-  _rues_node_host()                 — base HTTP URL for the active node
-  _local_node_heights               — per-node block heights from local WS
-
-Imports: config, wallet (for operator_cmd in decode), rotation (callbacks).
+Protocol:
+  1. Connect to wss://<node>/on  -> receive session ID string
+  2. Subscribe: HTTP GET /on/<path>  with Rusk-Session-Id header
+  3. Binary frame: [u32 LE header_len][JSON header][raw payload]
+     Header contains Content-Location identifying the topic.
 """
 import json
+import struct
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
-from .config import (
-    _log, CONTRACT_ID, RUSK_VERSION, NODE_INDICES, cfg,
-)
+from .config import _log, RUSK_VERSION
 
-# ── Event log ─────────────────────────────────────────────────────────────────
-_event_log:      list = []
-_event_log_lock        = threading.Lock()
-_event_seen:     set  = set()
-_rues_seen:      set  = set()
+_ws_url:      str  = ""
+_session_id:  str  = ""
+_connected:   bool = False
+_running:     bool = False
+_sub_results: dict = {}
+_sub_lock          = threading.Lock()
+_state_lock        = threading.Lock()
 
-_CONFIRM_SECS           = 120
-_POLLER_STALE_THRESHOLD = 1
+_event_log: deque = deque(maxlen=500)
+_log_lock          = threading.Lock()
 
-# ── RUES connection state ─────────────────────────────────────────────────────
-_RUES_RUNNING     = False
-_RUES_SESSION_ID: str = ""
-_RUES_WS_URL      = "ws://127.0.0.1:8080/on"   # default: local node 0
-_RUES_BLOCK_CACHE: dict       = {}
-_RUES_BLOCK_CACHE_LOCK        = threading.Lock()
+# Raw frame log — stores every WS message regardless of parse success
+_raw_log: deque = deque(maxlen=200)
+_raw_log_lock     = threading.Lock()
 
-_RUES_TOPICS = [
-    "activate", "deactivate", "liquidate", "terminate",
-    "reward-terminate", "reward-recycle", "unstake", "deposit",
-    "donate", "reward",
-    "block_accepted",
-    "tx/included", "tx/removed", "tx/executed",
-]
-_RUES_DEFAULT_TOPICS = list(_RUES_TOPICS)
-_RUES_SUB_RESULTS: dict = {t: "unsubscribed" for t in _RUES_TOPICS}
+# All subscribable topics: key -> URL path template (CONTRACT_ID substituted at runtime)
+# Paths match Dusk RUES API exactly as documented.
+TOPIC_PATHS = {
+    "block_accepted":   "/on/blocks/accepted",
+    "activate":         "/on/contracts:{cid}/stake_activate",
+    "deactivate":       "/on/contracts:{cid}/stake_deactivate",
+    "liquidate":        "/on/contracts:{cid}/liquidate",
+    "terminate":        "/on/contracts:{cid}/terminate",
+    "recycle":          "/on/contracts:{cid}/recycle",
+    "sozu-stake":       "/on/contracts:{cid}/sozu_stake",
+    "deposit":          "/on/contracts:{cid}/deposit",
+    "reward":           "/on/contracts:{cid}/reward",
+    "tx/included":      "/on/transactions/included",
+    "tx/executed":      "/on/transactions/executed",
+}
 
-# ── Local node heights ────────────────────────────────────────────────────────
-_local_node_heights: dict      = {0: None, 1: None, 2: None}
-_local_node_heights_lock       = threading.Lock()
+# Virtual filter keys — not separate subscriptions, derived from reward.operation
+VIRTUAL_FILTERS = {
+    "reward-recycle":   ("reward", "recycle"),
+    "reward-terminate": ("reward", "terminate"),
+}
 
-# ── RUES debug log ────────────────────────────────────────────────────────────
-_rues_debug_log: list   = []
-_rues_debug_lock        = threading.Lock()
-
-# ── TX sender cache (for _check_external_op) ─────────────────────────────────
-_rues_tx_sender_cache: dict      = {}
-_rues_tx_sender_cache_lock       = threading.Lock()
-
-
-def _rues_node_host() -> str:
-    """HTTP base URL derived from the currently active _RUES_WS_URL."""
-    return (_RUES_WS_URL
-            .replace("wss://", "https://")
-            .replace("ws://",  "http://")
-            .rstrip("/on").rstrip("/"))
+DEFAULT_SUBSCRIBE = list(TOPIC_PATHS.keys())
 
 
-def _rues_topic_url(topic: str) -> str:
-    base = _rues_node_host()
-    if topic == "block_accepted":
-        return f"{base}/on/blocks/accepted"
-    if topic.startswith("tx/"):
-        return f"{base}/on/transactions/{topic[3:]}"
-    return f"{base}/on/contracts:{CONTRACT_ID}/{topic}"
+def _path(key: str) -> str:
+    from .config import CONTRACT_ID
+    return TOPIC_PATHS[key].replace("{cid}", CONTRACT_ID)
 
 
-def _rues_dbg(msg: str, raw_hex: str = "", ping: bool = False, tx_count: int = -1):
-    ts   = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    ts_s = ts[:8]
-    entry = {"ts": ts, "msg": msg, "raw": raw_hex, "ping": ping, "tx_count": tx_count, "dups": 0}
-    with _rues_debug_lock:
-        if _rues_debug_log:
-            prev = _rues_debug_log[-1]
-            if (prev["msg"][:120] == msg[:120] and prev["ts"][:8] == ts_s and not ping):
-                prev["dups"] = prev.get("dups", 0) + 1
-                return
-        _rues_debug_log.append(entry)
-        if len(_rues_debug_log) > 2000:
-            del _rues_debug_log[:-2000]
+# Reverse map: URL path suffix -> display key
+# e.g. "stake_activate" -> "activate"
+_LOCATION_TO_KEY = {
+    _path_val.split("/")[-1].replace("{cid}", ""): key
+    for key, _path_val in TOPIC_PATHS.items()
+    if not _path_val.startswith("/on/blocks") and not _path_val.startswith("/on/transactions")
+}
+# Add tx and block mappings explicitly
+_LOCATION_TO_KEY.update({
+    "accepted": "block_accepted",
+    "included": "tx/included",
+    "executed": "tx/executed",
+})
 
 
-def _wait_for_event(topic_substr: str, addr_prefix: str,
-                    log_cursor: int, timeout: int = _CONFIRM_SECS) -> tuple:
-    """Poll _event_log for a matching event. Returns (status, block_height)."""
-    deadline     = time.time() + timeout
-    events_seen  = 0
-    baseline_len = log_cursor
-
-    while time.time() < deadline:
-        with _event_log_lock:
-            entries   = list(_event_log[log_cursor:])
-            total_now = len(_event_log)
-        events_seen  += total_now - baseline_len
-        baseline_len  = total_now
-
-        for ev in entries:
-            if topic_substr not in ev.get("topic", ""):
-                continue
-            haystack = json.dumps(ev.get("decoded", "")) + ev.get("data", "")
-            if addr_prefix in haystack:
-                return "confirmed", ev.get("block_height", 0)
-        time.sleep(3)
-
-    if events_seen < _POLLER_STALE_THRESHOLD:
-        return "stale", 0
-    return "timeout", 0
+def _topic_from_location(location: str) -> str:
+    """Derive display key from Content-Location."""
+    loc = location.rstrip("/")
+    segment = loc.split("/")[-1]
+    # Strip contract entity prefix if present (e.g. "contracts:HASH" -> use segment after)
+    return _LOCATION_TO_KEY.get(segment, segment)
 
 
-def _log_event(entry: dict) -> None:
-    dedup_key = (entry.get("height"), entry.get("_source", ""), entry.get("topic", ""))
-    is_rues   = bool(entry.get("_rues"))
-    with _event_log_lock:
-        if dedup_key in _event_seen:
-            if is_rues and dedup_key not in _rues_seen:
-                for existing in reversed(_event_log):
-                    ek = (existing.get("height"), existing.get("_source", ""), existing.get("topic", ""))
-                    if ek == dedup_key:
-                        existing["_rues"] = True
-                        break
-                _rues_seen.add(dedup_key)
-            return
-        _event_seen.add(dedup_key)
-        if is_rues:
-            _rues_seen.add(dedup_key)
-        _event_log.append(entry)
-        if len(_event_log) > 2000:
-            del _event_log[:-2000]
+def _parse_frame(raw: bytes):
+    """Parse RUES binary frame.
 
+    Two formats observed in the wild:
+    A) [u32 LE header_len][JSON header bytes][payload bytes]  — documented format
+    B) [some binary prefix][JSON header starting with {][payload bytes]  — some nodes
 
-def _rues_parse_message(raw: bytes) -> tuple:
+    Try A first, fall back to B (scan for first '{').
+    """
+    # Try format A: u32 LE header length
+    if len(raw) >= 4:
+        header_len = struct.unpack_from("<I", raw, 0)[0]
+        if 0 < header_len < len(raw) - 4:
+            try:
+                header = json.loads(raw[4:4 + header_len])
+                if isinstance(header, dict) and "Content-Location" in header:
+                    return header, raw[4 + header_len:]
+            except Exception:
+                pass
+
+    # Fall back to format B: scan for JSON header starting with '{'
     brace_idx = raw.find(b'{')
     if brace_idx == -1:
-        return {}, raw
+        return None
     json_bytes = raw[brace_idx:]
     depth = 0
     for i, b in enumerate(json_bytes):
-        if b == ord('{'):  depth += 1
+        if b == ord('{'): depth += 1
         elif b == ord('}'): depth -= 1
         if depth == 0:
             try:
-                hdr = json.loads(json_bytes[:i+1].decode("utf-8", errors="replace"))
-                if isinstance(hdr, dict) and "Content-Location" in hdr:
-                    return hdr, json_bytes[i+1:]
+                header = json.loads(json_bytes[:i + 1])
+                if isinstance(header, dict) and "Content-Location" in header:
+                    return header, json_bytes[i + 1:]
             except Exception:
                 pass
             break
-    return {}, raw
+    return None
 
 
-def _rues_decode(topic: str, data_bytes: bytes, is_block_event: bool = False):
-    if is_block_event or topic.startswith("tx/"):
-        try:
-            return json.loads(data_bytes.decode("utf-8", errors="replace").strip())
-        except Exception as e:
-            return {"_raw_len": len(data_bytes), "_parse_err": str(e)}
-    import subprocess as _sp
-    hex_val   = "0x" + data_bytes.hex()
-    node_host = _rues_node_host()
-    url       = f"{node_host}/on/driver:{CONTRACT_ID}/decode_event:{topic}"
+def _http(sid: str, path: str, method: str = "GET") -> bool:
+    import urllib.request as _ur, urllib.error as _ue
+    from .config import _NODE_STATE_URL
+    url = _NODE_STATE_URL.rstrip("/") + path
     try:
-        r = _sp.run(["curl", "-s", "-X", "POST", url,
-                     "-H", f"rusk-version: {RUSK_VERSION}", "-d", hex_val],
-                    capture_output=True, text=True, timeout=12)
-        stdout = r.stdout.strip()
-        if not stdout:
-            return {"_decode_error": "empty response", "_payload_len": len(data_bytes)}
-        return json.loads(stdout)
+        req = _ur.Request(url, method=method,
+                          headers={"Rusk-Session-Id": sid,
+                                   "rusk-version": RUSK_VERSION})
+        with _ur.urlopen(req, timeout=10) as r:
+            r.read()
+        return True
+    except _ue.HTTPError as e:
+        if e.code == 424:
+            return True
+        _log(f"[rues] HTTP {method} {path} => {e.code}")
+        return False
     except Exception as e:
-        return {"_decode_error": str(e), "_payload_len": len(data_bytes)}
+        _log(f"[rues] HTTP {method} {path} error: {e}")
+        return False
 
 
-def _rues_subscribe(session_id: str):
-    import urllib.request as _ur, urllib.error as _uerr
-    for topic in _RUES_DEFAULT_TOPICS:
-        url = _rues_topic_url(topic)
-        try:
-            req = _ur.Request(url, method="GET",
-                              headers={"Rusk-Session-Id": session_id,
-                                       "rusk-version": RUSK_VERSION})
-            with _ur.urlopen(req, timeout=8) as r:
-                resp_body = r.read()
-            _RUES_SUB_RESULTS[topic] = f"ok ({resp_body[:40]})"
-            _rues_dbg(f"subscribed {topic}")
-        except _uerr.HTTPError as e:
-            if e.code == 424:
-                _RUES_SUB_RESULTS[topic] = "ok (auto)"
-                _rues_dbg(f"subscribed {topic} (424 → auto-subscribed by node)")
-            else:
-                _RUES_SUB_RESULTS[topic] = f"FAILED: HTTP {e.code}"
-                _rues_dbg(f"subscribe {topic} FAILED: HTTP {e.code}")
-        except Exception as e:
-            _RUES_SUB_RESULTS[topic] = f"FAILED: {e}"
-            _rues_dbg(f"subscribe {topic} FAILED: {e}")
+def _decode_fn_args_inplace(parsed: dict) -> None:
+    """Walk a decoded tx dict, find fn_args fields and decode them via the driver endpoint.
+    Modifies parsed in-place, adding a '_fn_args_decoded' key alongside fn_args.
+    Handles both tx/included (call at top level) and tx/executed (call under 'inner').
+    """
+    import base64 as _b64, subprocess as _sp
+    from .config import _NODE_STATE_URL, CONTRACT_ID
 
-
-def _rues_thread():
-    global _RUES_RUNNING, _RUES_SESSION_ID
-    try:
-        import websocket as _ws
-    except ImportError as ie:
-        _rues_dbg(f"FATAL: websocket-client not installed: {ie}")
-        _RUES_RUNNING = False
+    # Find the call dict — either top-level or under 'inner'
+    call = parsed.get("call") or (parsed.get("inner") or {}).get("call")
+    if not call:
         return
 
-    backoff = 2
-    _rues_dbg("thread started")
+    fn_name = call.get("fn_name", "")
+    fn_args = call.get("fn_args", "")
+    if not fn_name or not fn_args:
+        return
 
-    while _RUES_RUNNING:
-        session_id = ""
+    try:
+        raw_bytes = _b64.b64decode(fn_args)
+        hex_val   = "0x" + raw_bytes.hex()
+        url = f"{_NODE_STATE_URL}/on/driver:{CONTRACT_ID}/decode_input_fn:{fn_name}"
+        r = _sp.run(
+            ["curl", "-s", "-X", "POST", url,
+             "-H", f"rusk-version: {RUSK_VERSION}",
+             "-H", "Content-Type: text/plain",
+             "-d", hex_val],
+            capture_output=True, text=True, timeout=8)
+        result = r.stdout.strip()
+        if result and not result.startswith("<") and len(result) > 2:
+            try:
+                call["_fn_args_decoded"] = json.loads(result)
+            except Exception:
+                call["_fn_args_decoded"] = result[:500]
+    except Exception as e:
+        _log(f"[rues] fn_args decode {fn_name}: {e}")
+
+
+def _decode_payload(location: str, payload: bytes) -> dict:
+    loc = location.strip()
+    is_block = "blocks" in loc  # handles blocks:HASH/accepted and /on/blocks/...
+    is_tx    = "transactions" in loc  # handles transactions:HASH/executed and /on/transactions/...
+
+    if is_block or is_tx:
+        # Try JSON first (local nodes send JSON, testnet sends binary/protobuf)
+        text = payload.decode("utf-8", errors="replace").strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                # Decode fn_args in place if present (base64 -> hex -> driver decode)
+                _decode_fn_args_inplace(parsed)
+                return parsed
+            except Exception:
+                pass
+
+        # Binary payload — try driver decode endpoint
+        # Use decode_raw_transaction for tx events, decode_block for blocks
+        topic_name = loc.rstrip("/").split("/")[-1]  # "accepted", "executed", "included"
         try:
-            _rues_dbg(f"connecting to {_RUES_WS_URL}")
-            ws = _ws.create_connection(_RUES_WS_URL, timeout=30, ping_interval=0)
-            raw_sid = ws.recv()
-            if isinstance(raw_sid, bytes):
-                raw_sid = raw_sid.decode("utf-8", errors="replace")
-            session_id = raw_sid.strip().strip('"')
-            _RUES_SESSION_ID = session_id
-            _rues_dbg(f"connected session={session_id}")
-            _log(f"[rues] connected — session={session_id[:16]}…")
-
-            time.sleep(0.3)   # let remote node index the session before subscribing
-            _rues_subscribe(session_id)
-
-            # Seed pool balance cache
-            try:
-            from .pool import _pool_fetch_real
-                _pool_fetch_real()
-            except Exception:
-                pass
-
-            last_ping = time.time()
-            backoff   = 2
-
-            while _RUES_RUNNING:
-                if time.time() - last_ping > 30:
-                    try:
-                        ws.ping()
-                        last_ping = time.time()
-                        _rues_dbg("ping sent", "", ping=True)
-                    except Exception:
-                        break
-
-                ws.settimeout(5)
+            import subprocess as _sp
+            from .config import _NODE_STATE_URL, CONTRACT_ID
+            hex_val = "0x" + payload.hex()
+            # Try the generic driver decode
+            driver_topic = "decode_raw_transaction" if is_tx else "decode_block"
+            url = f"{_NODE_STATE_URL}/on/driver:{CONTRACT_ID}/decode_event:{driver_topic}"
+            r = _sp.run(
+                ["curl", "-s", "-X", "POST", url,
+                 "-H", f"rusk-version: {RUSK_VERSION}",
+                 "-d", hex_val],
+                capture_output=True, text=True, timeout=8)
+            result = r.stdout.strip()
+            _log(f"[rues] driver decode {driver_topic}: {result[:80]}")
+            if result and not result.startswith("<") and not result.startswith("error"):
                 try:
-                    raw = ws.recv()
-                except _ws.WebSocketTimeoutException:
-                    continue
+                    return json.loads(result)
                 except Exception:
-                    break
-
-                if not raw:
-                    continue
-
-                raw_bytes     = raw if isinstance(raw, bytes) else raw.encode("utf-8")
-                hdr, payload  = _rues_parse_message(raw_bytes)
-                if not hdr:
-                    continue
-
-                location      = hdr.get("Content-Location", "")
-                block_origin  = hdr.get("Rusk-Origin", "")
-
-                is_block_event = "/blocks:" in location
-                topic = ""
-                if is_block_event:
-                    topic = "block_accepted"
-                else:
-                    loc_parts = location.split("/")
-                    for part in reversed(loc_parts):
-                        if part and ":" not in part:
-                            topic = part
-                            break
-                    if not topic:
-                        for part in reversed(loc_parts):
-                            if part.startswith("contracts:") or part.startswith("transactions"):
-                                continue
-                            topic = part
-                            break
-
-                if not topic:
-                    continue
-
-                decoded = _rues_decode(topic, payload, is_block_event=is_block_event)
-
-                # Compact block display
-                decoded_display = decoded
-                _btx = -1
-                if is_block_event and isinstance(decoded, dict):
-                    hdr_raw = decoded.get("header") or {}
-                    txs     = decoded.get("transactions") or []
-                    _btx    = len(txs)
-                    height_val = int(hdr_raw.get("height", 0) or 0)
-                    block_hash = hdr_raw.get("hash", "")
-                    if height_val and block_hash:
-                        with _RUES_BLOCK_CACHE_LOCK:
-                            _RUES_BLOCK_CACHE[block_hash] = height_val
-                            if len(_RUES_BLOCK_CACHE) > 500:
-                                del _RUES_BLOCK_CACHE[next(iter(_RUES_BLOCK_CACHE))]
-                    decoded_display = {
-                        "height": height_val, "hash": hdr_raw.get("hash", ""),
-                        "tx_count": _btx,
-                    }
-
-                op   = decoded.get("operation", "") if isinstance(decoded, dict) else ""
-                display_topic = f"{topic}-{op}" if op else topic
-
-                with _RUES_BLOCK_CACHE_LOCK:
-                    height = _RUES_BLOCK_CACHE.get(block_origin, 0)
-
-                entry = {
-                    "ts":      datetime.now().strftime("%H:%M:%S"),
-                    "height":  height,
-                    "topic":   display_topic,
-                    "decoded": decoded_display,
-                    "data":    payload.hex(),
-                    "_source": CONTRACT_ID,
-                    "_rues":   True,
-                    "_origin": block_origin,
-                }
-                _log_event(entry)
-
-                empty_tag = " [empty]" if (topic == "block_accepted" and _btx == 0) else ""
-                tx_info   = f" txs={_btx}" if topic == "block_accepted" else ""
-                _rues_dbg(f"decoded {display_topic}{empty_tag}{tx_info}", tx_count=_btx)
-
-                # ── Rotation callbacks ────────────────────────────────────────
-                try:
-            from .rotation import (
-                        _on_block_accepted, _on_deposit_event,
-                        _on_liquidate_event, _on_reward_recycle_event,
-                    )
-                    from .config import cfg as _cfg_fn
-                    if topic == "block_accepted" and isinstance(decoded_display, dict):
-                        h = decoded_display.get("height", 0)
-                        if h:
-                            _on_block_accepted(h)
-                    elif topic == "deposit" and isinstance(decoded_display, dict):
-                        _on_deposit_event(decoded_display)
-                    elif topic == "liquidate" and isinstance(decoded_display, dict):
-                        our_provs = [_cfg_fn(f"prov_{i}_address") for i in range(3)]
-                        is_own    = decoded_display.get("provisioner", "") in our_provs
-                        _on_liquidate_event(decoded_display, is_own)
-                    elif topic == "reward-recycle" and isinstance(decoded_display, dict):
-                        _on_reward_recycle_event(decoded_display)
-                except Exception as _cb_err:
-                    _log(f"[rues] rotation callback error: {_cb_err}")
-
-            try:
-                ws.close()
-            except Exception:
-                pass
-
+                    return {"_decoded_text": result[:500]}
         except Exception as e:
-            _log(f"[rues] connection error: {e}")
-            _RUES_SESSION_ID = ""
+            _log(f"[rues] driver decode error: {e}")
 
-        for t in _RUES_TOPICS:
-            _RUES_SUB_RESULTS[t] = "unsubscribed"
-        _rues_dbg(f"reconnect in {backoff}s")
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+        # Fall back: return hex preview so UI can show something
+        return {
+            "_raw_bytes": len(payload),
+            "_hex_preview": payload[:32].hex(),
+        }
+
+    # contracts:HASH/stake_activate  or  /on/contracts:HASH/...
+    if "contracts:" in loc:
+        topic_name = loc.rstrip("/").split("/")[-1]
+        try:
+            import subprocess as _sp
+            from .config import _NODE_STATE_URL, CONTRACT_ID
+            hex_val = "0x" + payload.hex()
+            url     = f"{_NODE_STATE_URL}/on/driver:{CONTRACT_ID}/decode_event:{topic_name}"
+            r = _sp.run(
+                ["curl", "-s", "-X", "POST", url,
+                 "-H", f"rusk-version: {RUSK_VERSION}",
+                 "-d", hex_val],
+                capture_output=True, text=True, timeout=8)
+            result = r.stdout.strip()
+            if result and not result.startswith("<"):
+                return json.loads(result)
+        except Exception as e:
+            _log(f"[rues] decode_event {topic_name}: {e}")
+        return {"_raw_bytes": len(payload), "_hex": payload[:16].hex()}
+
+    return {"_raw_bytes": len(payload)}
 
 
-def _local_node_ws_thread(node_idx: int):
-    """Connect to local rusk WS for node_idx, update _local_node_heights on block_accepted."""
+def _append_log(topic: str, header: dict, decoded: dict, payload: bytes) -> None:
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    height = None
+    if topic == "block_accepted":
+        h = decoded.get("header") or {}
+        height = (int(h.get("height", 0) or 0)
+                  or int(decoded.get("height", 0) or 0))
+        # Content-Location: blocks:HASH/accepted — no height there
+        # Try Rusk-Origin header if set
+        if not height:
+            origin = header.get("Rusk-Origin", "")
+            import re as _re
+            m = _re.search(r":(\d+)/", header.get("Content-Location", ""))
+            if m:
+                height = int(m.group(1))
+        if height:
+            _log(f"[rues] block height={height}")
+    entry = {
+        "ts":          ts,
+        "topic":       topic,
+        "height":      height,
+        "decoded":     decoded,
+        "payload_len": len(payload),
+    }
+    with _log_lock:
+        _event_log.appendleft(entry)
+    if height:
+        try:
+            from .nodes import _on_remote_block
+            _on_remote_block(height)
+        except Exception:
+            pass
+    # Fire event action engine
+    try:
+        from .events import on_event
+        on_event(topic, decoded, height)
+    except Exception as _ev_err:
+        _log(f"[events] on_event({topic}) error: {_ev_err}")
+
+
+
+def _rues_thread() -> None:
+    global _session_id, _connected, _running, _ws_url
     try:
         import websocket as _ws
     except ImportError:
+        _log("[rues] websocket-client not installed")
         return
 
+    from .config import _NODE_STATE_URL
+    ws_url = (_NODE_STATE_URL
+              .replace("https://", "wss://")
+              .replace("http://",  "ws://")
+              .rstrip("/") + "/on")
+
+    with _state_lock:
+        _ws_url = ws_url
+
     backoff = 2
-    while True:
-        port = int(cfg(f"node_{node_idx}_ws_port") or [8080, 8282, 8383][node_idx])
-        url  = f"ws://localhost:{port}/on"
+    _log(f"[rues] connecting to {ws_url}")
+
+    while _running:
+        ws = None
         try:
-            ws = _ws.create_connection(url, timeout=10, ping_interval=0)
+            ws = _ws.create_connection(ws_url, timeout=30)
+
+            # First message = session ID
             raw_sid = ws.recv()
-            if isinstance(raw_sid, bytes):
-                raw_sid = raw_sid.decode("utf-8", errors="replace")
-            session_id = raw_sid.strip().strip('"')
-            _log(f"[node{node_idx}] connected session={session_id[:16]}…")
+            sid = (raw_sid.decode() if isinstance(raw_sid, bytes) else raw_sid).strip().strip('"')
+            with _state_lock:
+                _session_id = sid
+            _log(f"[rues] connected session={sid}")
 
-            import urllib.request as _ur2, urllib.error as _uerr2
-            sub_url = f"http://localhost:{port}/on/blocks/accepted"
-            try:
-                req = _ur2.Request(sub_url, method="GET",
-                                   headers={"Rusk-Session-Id": session_id,
-                                            "rusk-version": RUSK_VERSION})
-                with _ur2.urlopen(req, timeout=6) as r:
-                    r.read()
-                _log(f"[node{node_idx}] subscribed to blocks/accepted")
-            except _uerr2.HTTPError as he:
-                if he.code == 424:
-                    _log(f"[node{node_idx}] 424 → auto-subscribed")
-                else:
-                    _log(f"[node{node_idx}] subscribe failed: HTTP {he.code}")
-                    ws.close()
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60)
-                    continue
-            except Exception as se:
-                _log(f"[node{node_idx}] subscribe failed: {se}")
-                ws.close()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
+            time.sleep(0.3)
 
-            last_ping = time.time()
-            backoff   = 2
+            # Subscribe
+            with _sub_lock:
+                _sub_results.clear()
+            for key in DEFAULT_SUBSCRIBE:
+                path_str = _path(key)
+                ok = _http(sid, path_str, "GET")
+                with _sub_lock:
+                    _sub_results[key] = "ok" if ok else "failed"
+                _log(f"[rues] subscribe '{key}' {path_str} => {'OK' if ok else 'FAILED'}")
 
-            while True:
-                if time.time() - last_ping > 30:
+            _log("[rues] subscribed, listening for frames...")
+            with _state_lock:
+                _connected = True
+            backoff     = 2
+            frame_count = 0
+
+            # Dedicated ping thread
+            _ping_stop = threading.Event()
+            def _ping_loop(wsc=ws, stop=_ping_stop):
+                while not stop.wait(20):
                     try:
-                        ws.ping()
-                        last_ping = time.time()
+                        wsc.ping()
                     except Exception:
                         break
+            threading.Thread(target=_ping_loop, daemon=True).start()
 
-                ws.settimeout(5)
+            while _running:
+                ws.settimeout(30)
                 try:
                     raw = ws.recv()
                 except _ws.WebSocketTimeoutException:
+                    _log(f"[rues] recv timeout ({frame_count} frames so far)")
                     continue
-                except Exception:
+                except Exception as exc:
+                    _log(f"[rues] recv error: {exc}")
                     break
 
                 if not raw:
                     continue
 
-                raw_bytes = raw if isinstance(raw, bytes) else raw.encode("utf-8")
-                hdr, payload = _rues_parse_message(raw_bytes)
-                if "/blocks:" not in hdr.get("Content-Location", ""):
+                raw_bytes = raw if isinstance(raw, bytes) else raw.encode()
+                frame_count += 1
+                if frame_count <= 5:
+                    _log(f"[rues] frame #{frame_count}: {len(raw_bytes)}B hex={raw_bytes[:16].hex()}")
+
+                ts_raw = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                raw_entry = {
+                    "ts": ts_raw, "len": len(raw_bytes),
+                    "hex": raw_bytes[:64].hex(),
+                    "text": raw_bytes[:300].decode("utf-8", errors="replace"),
+                    "parsed": False,
+                    "payload_text": "",
+                }
+                with _raw_log_lock:
+                    _raw_log.appendleft(raw_entry)
+
+                result = _parse_frame(raw_bytes)
+                if result is None:
                     continue
 
-                try:
-                    decoded   = json.loads(payload.decode("utf-8", errors="replace").strip())
-                    hdr_inner = decoded.get("header") or {}
-                    height    = int(hdr_inner.get("height", 0) or 0)
-                    if height:
-                        with _local_node_heights_lock:
-                            _local_node_heights[node_idx] = height
-                        # Push to rotation_state for dashboard
-                        try:
-            from .rotation import _rotation_state
-                            _rotation_state[f"node{node_idx}_height"] = height
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                header, payload = result
+                raw_entry["parsed"]       = True
+                raw_entry["location"]     = header.get("Content-Location", "")
+                raw_entry["payload_text"] = payload.decode("utf-8", errors="replace")
 
+                location = header.get("Content-Location", "")
+                if not location:
+                    continue
+
+                topic   = _topic_from_location(location)
+                decoded = _decode_payload(location, payload)
+                # Update raw_entry payload_text with the fully decoded dict
+                # (includes _fn_args_decoded if decode_input_fn succeeded)
+                if isinstance(decoded, dict) and "_raw_bytes" not in decoded:
+                    try:
+                        raw_entry["payload_text"] = json.dumps(decoded, indent=2)
+                    except Exception:
+                        pass
+                _append_log(topic, header, decoded, payload)
+
+            _ping_stop.set()
+
+        except Exception as exc:
+            _log(f"[rues] error: {exc}")
+        finally:
             try:
-                ws.close()
+                if ws:
+                    ws.close()
             except Exception:
                 pass
 
-        except Exception as e:
-            _log(f"[node{node_idx}] connection error: {e}")
+        with _state_lock:
+            _connected  = False
+            _session_id = ""
 
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+        if _running:
+            _log(f"[rues] reconnect in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+def start() -> None:
+    global _running
+    if _running:
+        return
+    _running = True
+    threading.Thread(target=_rues_thread, daemon=True, name="rues").start()
 
 
-def _start_local_node_monitors():
-    for idx in NODE_INDICES:
-        threading.Thread(target=_local_node_ws_thread, args=(idx,),
-                         daemon=True, name=f"node{idx}_ws").start()
-    _log("[node_ws] local node height monitors started")
+def get_status() -> dict:
+    with _state_lock:
+        sid  = _session_id
+        conn = _connected
+        url  = _ws_url
+    with _sub_lock:
+        subs = dict(_sub_results)
+    with _log_lock:
+        log = list(_event_log)
+    with _raw_log_lock:
+        raw = list(_raw_log)
+    return {
+        "connected":      conn,
+        "session_id":     sid,
+        "ws_url":         url,
+        "subscriptions":  subs,
+        "all_topics":     list(TOPIC_PATHS.keys()),
+        "virtual_filters": {k: {"topic": v[0], "operation": v[1]}
+                            for k, v in VIRTUAL_FILTERS.items()},
+        "log":            log,
+        "raw_log":        raw,
+    }
 
 
-def _start_rues():
-    global _RUES_RUNNING
-    if not _RUES_RUNNING:
-        _RUES_RUNNING = True
-        threading.Thread(target=_rues_thread, daemon=True, name="rues").start()
-        _log("[rues] subscriber started")
+def subscribe_topic(key: str, action: str = "subscribe") -> dict:
+    with _state_lock:
+        sid = _session_id
+    if not sid:
+        return {"ok": False, "error": "no active session"}
+    if key not in TOPIC_PATHS:
+        return {"ok": False, "error": f"unknown topic: {key}"}
+    method = "DELETE" if action == "unsubscribe" else "GET"
+    ok     = _http(sid, _path(key), method)
+    with _sub_lock:
+        _sub_results[key] = ("ok" if ok else "failed") if action == "subscribe" else "unsubscribed"
+    return {"ok": ok, "topic": key, "action": action}

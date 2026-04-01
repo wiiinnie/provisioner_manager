@@ -61,7 +61,7 @@ def _ensure_own_keys(pw: str) -> None:
     for idx in NODE_INDICES:
         sk = cfg(f"prov_{idx}_sk") or ""
         if not sk:
-            from config import _get_sk
+            from .config import _get_sk
             sk = _get_sk(idx)
         if sk:
             try:
@@ -112,7 +112,7 @@ def _assess_state(tip: int, pw: str) -> dict:
         except Exception:
             pass
 
-    current_epoch = si_epoch
+    current_epoch = si_epoch  # from stake-info response
 
     for idx in NODE_INDICES:
         addr      = cfg(f"prov_{idx}_address") or ""
