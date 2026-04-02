@@ -35,23 +35,18 @@ _raw_log_lock     = threading.Lock()
 # Paths match Dusk RUES API exactly as documented.
 TOPIC_PATHS = {
     "block_accepted":   "/on/blocks/accepted",
-    "activate":         "/on/contracts:{cid}/stake_activate",
-    "deactivate":       "/on/contracts:{cid}/stake_deactivate",
-    "liquidate":        "/on/contracts:{cid}/liquidate",
-    "terminate":        "/on/contracts:{cid}/terminate",
-    "recycle":          "/on/contracts:{cid}/recycle",
-    "sozu-stake":       "/on/contracts:{cid}/sozu_stake",
+    "activate":         "/on/contracts:{cid}/activate",
+    "deactivate":       "/on/contracts:{cid}/deactivate",
     "deposit":          "/on/contracts:{cid}/deposit",
+    "donate":           "/on/contracts:{cid}/donate",
+    "liquidate":        "/on/contracts:{cid}/liquidate",
     "reward":           "/on/contracts:{cid}/reward",
+    "unstake":          "/on/contracts:{cid}/unstake",
     "tx/included":      "/on/transactions/included",
     "tx/executed":      "/on/transactions/executed",
 }
 
-# Virtual filter keys — not separate subscriptions, derived from reward.operation
-VIRTUAL_FILTERS = {
-    "reward-recycle":   ("reward", "recycle"),
-    "reward-terminate": ("reward", "terminate"),
-}
+# No virtual filters needed — reward events are filtered by operation in the UI if desired
 
 DEFAULT_SUBSCRIBE = list(TOPIC_PATHS.keys())
 
@@ -454,8 +449,6 @@ def get_status() -> dict:
         "ws_url":         url,
         "subscriptions":  subs,
         "all_topics":     list(TOPIC_PATHS.keys()),
-        "virtual_filters": {k: {"topic": v[0], "operation": v[1]}
-                            for k, v in VIRTUAL_FILTERS.items()},
         "log":            log,
         "raw_log":        raw,
     }

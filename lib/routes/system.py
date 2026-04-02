@@ -18,7 +18,7 @@ from ..wallet import run_cmd, wallet_cmd, get_password, _cache_wallet_pw, OPERAT
 
 bp = Blueprint("system", __name__)
 
-SERVER_VERSION = "1.0.6"
+SERVER_VERSION = "2.0.0"
 
 
 @bp.route("/api/ping")
@@ -237,3 +237,9 @@ def deposit_log_clear():
     with _deposit_log_lock:
         _deposit_log.clear()
     return jsonify({"ok": True})
+
+
+@bp.route("/api/events/race_counters", methods=["GET"])
+def race_counters():
+    from ..events import get_race_counters
+    return jsonify(get_race_counters())

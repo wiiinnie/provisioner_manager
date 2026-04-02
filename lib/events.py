@@ -1,37 +1,51 @@
 """
 events.py — RUES event action engine.
 
-Called by rues.py on every decoded event. Evaluates rules and triggers
-actions such as auto-allocating incoming deposits to provisioners.
+Allocation rules per window:
+  Regular / Rotation:
+    deposit           → allocate
+    reward/recycle    → allocate
+    reward/terminate  → allocate ONLY if own provisioner was terminated
 
-Architecture:
-  rues.py  →  on_event(topic, decoded, block_height)
-           →  _handle_deposit()   — checks thresholds, picks target, calls operator_cmd
-           →  _deposit_log        — ring buffer shown in dashboard deposit panel
+  Snatch:
+    deposit           → allocate
+    reward/recycle    → allocate
+    reward/terminate  → always allocate
 
-⚠ TODO (remind Matthias):
-  - Target selection is currently: any MATURING non-master provisioner.
-    Still missing conditions:
-      • Active node top-up logic (slash headroom check)
-      • Seeded node preference ordering
-      • Split across multiple nodes when amount exceeds per-node capacity
-      • Configurable target override (e.g. always prov[2] for deposits)
-      • Minimum stake balance enforcement (SEED_DUSK reservation)
+3-step deposit snatch flow:
+  Step 1 (deposit_received):  event arrived, stake-activate fired
+  Step 2 (tx_confirmed/failed): tx/executed result — win/loss decided here
+  Step 3 (activate_confirmed): activate contract event — stake is live on-chain
+
+⚠ TODO:
+  - Target selection incomplete: active top-up, multi-node split, capacity check,
+    seed reservation, configurable override
+  - Threshold check bypassed (if False) — re-enable when stable
+  - Deposit ownership filtering (depositor address) — "we need this later"
+  - block_height None for contract events — wire up block cache backfill
 """
 
-import json
 import threading
 import time
 from collections import deque
 from datetime import datetime
 
-from .config import _log, cfg, CONTRACT_ID
+from .config import _log, cfg
 
-EPOCH_BLOCKS: int = 2160  # Dusk network constant
+EPOCH_BLOCKS: int = 2160
 
-# ── Deposit action log ────────────────────────────────────────────────────────
-_deposit_log: deque = deque(maxlen=200)
-_deposit_log_lock    = threading.Lock()
+_deposit_log:      deque = deque(maxlen=200)
+_deposit_log_lock         = threading.Lock()
+
+_race_wins:   int = 0
+_race_losses: int = 0
+_race_lock         = threading.Lock()
+
+_recent_alloc:      dict = {}
+_recent_alloc_lock         = threading.Lock()
+
+_pending_activations: dict = {}
+_pending_lock               = threading.Lock()
 
 
 def _dlog(entry: dict) -> None:
@@ -46,28 +60,43 @@ def get_deposit_log() -> list:
         return list(_deposit_log)
 
 
-# ── Pending deposit tracking ──────────────────────────────────────────────────
-# When a deposit arrives we record it; when activate confirms we compute timing.
-_pending_deposits: dict = {}          # tx_hash → {ts, amount_dusk, block_height}
-_pending_lock            = threading.Lock()
-
-# Track activate events so we can match them back to deposits
-_pending_activations: dict = {}       # provisioner_addr → {deposit_ts, amount_dusk, deposit_block}
+def get_race_counters() -> dict:
+    with _race_lock:
+        return {"wins": _race_wins, "losses": _race_losses}
 
 
 def _now_ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+def _own_addresses() -> set:
+    addrs = set()
+    for k in ("prov_0_address", "prov_1_address", "prov_2_address"):
+        v = cfg(k)
+        if v:
+            addrs.add(v)
+    return addrs
+
+
+def _current_window(block_height: int | None) -> str:
+    rot_win    = int(cfg("rotation_window") or 41)
+    snatch_win = int(cfg("snatch_window")   or 11)
+    if not block_height:
+        return "regular"
+    blk_left = EPOCH_BLOCKS - (block_height % EPOCH_BLOCKS)
+    if blk_left <= snatch_win:
+        return "snatch"
+    if blk_left <= rot_win:
+        return "rotation"
+    return "regular"
+
 
 def on_event(topic: str, decoded: dict, block_height: int | None = None) -> None:
-    """Called by rues.py for every successfully decoded event."""
     if not isinstance(decoded, dict):
         return
     try:
-        if topic in ("deposit", "sozu-stake"):
-            _handle_deposit(decoded, block_height)
+        if topic == "deposit":
+            _handle_deposit(decoded, block_height, label="deposit")
         elif topic == "reward":
             _handle_reward(decoded, block_height)
         elif topic == "activate":
@@ -75,142 +104,103 @@ def on_event(topic: str, decoded: dict, block_height: int | None = None) -> None
         elif topic == "tx/executed":
             _handle_tx_executed(decoded, block_height)
     except Exception as e:
-        _log(f"[events] on_event error ({topic}): {e}")
+        _log(f"[events] on_event({topic}) error: {e}")
 
-
-# ── Deposit handler ───────────────────────────────────────────────────────────
 
 def _handle_reward(decoded: dict, block_height: int | None) -> None:
-    """
-    A reward contract event arrived.
-    operation == "recycle"   → reward from a recycle tx, fee_pool goes back to pool
-    operation == "terminate" → reward from provisioner termination, pool gets delegator rewards
-
-    fee_pool is the DUSK available for allocation. Treat exactly like a deposit:
-    check threshold and allocate to a maturing provisioner.
-    """
     operation   = decoded.get("operation", "unknown")
-    fee_pool_lux = int(str(decoded.get("fee_pool") or 0))
-    fee_pool_dusk = fee_pool_lux / 1e9
+    amount_lux  = int(str(decoded.get("amount") or 0))
+    window      = _current_window(block_height)
 
-    _dlog({
-        "type":      f"reward_{operation}",
-        "msg":       f"reward/{operation} fee_pool={fee_pool_dusk:,.4f} DUSK at blk#{block_height}",
-        "amount":    fee_pool_dusk,
-        "operation": operation,
-        "block":     block_height,
-        "ok":        True,
-    })
-
-    # Re-use deposit logic with the fee_pool amount
-    _handle_deposit(
-        {"amount": fee_pool_lux, "hash": "", "account": "reward"},
-        block_height,
-        label=f"reward/{operation}",
-    )
+    if operation == "recycle":
+        _handle_deposit(
+            {"amount": amount_lux, "hash": "", "account": "reward"},
+            block_height, label="reward/recycle",
+        )
+    elif operation == "terminate":
+        if window == "snatch":
+            _handle_deposit(
+                {"amount": amount_lux, "hash": "", "account": "reward"},
+                block_height, label="reward/terminate",
+            )
+        else:
+            provisioners = decoded.get("provisioners") or []
+            own = _own_addresses()
+            own_terminated = [p for p in provisioners if p in own]
+            if own_terminated:
+                _handle_deposit(
+                    {"amount": amount_lux, "hash": "", "account": "reward"},
+                    block_height, label="reward/terminate(own)",
+                )
+            else:
+                _log(f"[events] reward/terminate: no own prov in list — skip ({window})")
+    else:
+        _log(f"[events] reward: unknown operation={operation!r} — skip")
 
 
 def _handle_deposit(decoded: dict, block_height: int | None, label: str = "deposit") -> None:
-    """
-    A deposit/sozu-stake event arrived. Evaluate thresholds and trigger
-    stake-activate if conditions are met.
-
-    Current target selection (⚠ TODO — see module docstring):
-      Pick any MATURING provisioner that is NOT the master node.
-      Falls back to any non-master provisioner if none are maturing.
-    """
-    amount_lux  = decoded.get("amount") or decoded.get("value") or 0
-    amount_dusk = float(amount_lux) / 1e9 if amount_lux else 0.0
+    amount_lux  = int(str(decoded.get("amount") or decoded.get("value") or 0))
+    amount_dusk = amount_lux / 1e9
     depositor   = decoded.get("account") or decoded.get("sender") or ""
-    tx_hash     = decoded.get("hash") or ""
 
-    # Read thresholds and window from config
-    min_dep          = float(cfg("min_deposit_dusk")        or 100.0)
-    snatch_min_dep   = float(cfg("snatch_min_deposit_dusk") or 100.0)
-    rot_win          = int(cfg("rotation_window")           or 41)
-    snatch_win       = int(cfg("snatch_window")             or 11)
-    _master = cfg("master_idx")
-    master_idx     = int(_master) if _master is not None else -1
+    dedup_key = f"{label}|{amount_dusk:.4f}"
+    now = time.time()
+    with _recent_alloc_lock:
+        if now - _recent_alloc.get(dedup_key, 0) < 30:
+            _log(f"[events] dedup skip {label} {amount_dusk:.4f}")
+            return
+        _recent_alloc[dedup_key] = now
+        for k in list(_recent_alloc):
+            if now - _recent_alloc[k] > 60:
+                del _recent_alloc[k]
 
-    # Determine current epoch window from block height
-    window = "regular"
-    if block_height:
-        blk_left = EPOCH_BLOCKS - (block_height % EPOCH_BLOCKS)
-        if blk_left <= snatch_win:
-            window = "snatch"
-        elif blk_left <= rot_win:
-            window = "rotation"
+    window         = _current_window(block_height)
+    min_dep        = float(cfg("min_deposit_dusk")        or 100.0)
+    snatch_min_dep = float(cfg("snatch_min_deposit_dusk") or 100.0)
+    threshold      = snatch_min_dep if window == "snatch" else min_dep
 
-    # Apply threshold
-    threshold = snatch_min_dep if window == "snatch" else min_dep
-    # TODO: re-enable threshold check once allocation is confirmed working
-    # if amount_dusk < threshold:
+    # TODO: re-enable: if amount_dusk < threshold:
     if False:
-        _dlog({
-            "type":    "deposit_skipped",
-            "msg":     f"{label} {amount_dusk:,.4f} DUSK < threshold {threshold:,.0f} DUSK ({window}) — skipped",
-            "amount":  amount_dusk,
-            "window":  window,
-            "ok":      False,
-        })
+        _dlog({"type":"deposit_skipped","step":0,
+               "msg":f"{label} {amount_dusk:,.4f} DUSK < {threshold:,.0f} min ({window}) — skip",
+               "amount":amount_dusk,"window":window,"ok":False})
         return
 
+    _master    = cfg("master_idx")
+    master_idx = int(_master) if _master is not None else -1
+    target_idx, target_addr = _pick_target(master_idx)
+
+    if target_idx is None:
+        _dlog({"type":"deposit_error","step":1,
+               "msg":f"no eligible provisioner for {label} — all active or master-only",
+               "amount":amount_dusk,"window":window,"ok":False})
+        return
+
+    # Step 1
     _dlog({
         "type":      "deposit_received",
-        "msg":       f"{label} {amount_dusk:,.4f} DUSK in {window} window (≥{threshold:,.0f}) — allocating…",
+        "step":      1,
+        "msg":       f"{label} {amount_dusk:,.4f} DUSK ({window}) → activating prov[{target_idx}]…",
         "amount":    amount_dusk,
         "window":    window,
         "depositor": depositor,
         "block":     block_height,
+        "prov_idx":  target_idx,
+        "prov_addr": target_addr,
         "ok":        True,
     })
 
-    # Record for timing calculation
-    with _pending_lock:
-        _pending_deposits[tx_hash] = {
-            "ts":           _now_ts(),
-            "wall_ts":      time.time(),
-            "amount_dusk":  amount_dusk,
-            "block_height": block_height,
-        }
-
-    # Pick target provisioner
-    target_idx, target_addr = _pick_target(master_idx)
-    if target_idx is None:
-        _dlog({
-            "type": "deposit_error",
-            "msg":  f"no eligible provisioner found for {label} — all active or master-only",
-            "amount": amount_dusk,
-            "ok":   False,
-        })
-        return
-
-    _dlog({
-        "type": "deposit_allocating",
-        "msg":  f"allocating {amount_dusk:,.4f} DUSK → prov[{target_idx}] ({target_addr[:12]}…) [{label}]",
-        "amount": amount_dusk,
-        "ok":   True,
-    })
-
-    # Fire allocation in background thread — operator_cmd is blocking
     threading.Thread(
         target=_do_allocate,
-        args=(target_idx, target_addr, amount_dusk, block_height, tx_hash, depositor),
+        args=(target_idx, target_addr, amount_dusk, block_height),
         daemon=True,
     ).start()
 
 
 def _pick_target(master_idx: int) -> tuple:
-    """
-    Pick a target provisioner for deposit allocation.
-    Priority: MATURING non-master → any non-master with has_stake=False (inactive).
-
-    ⚠ TODO: extend with active top-up logic, seeded preference, multi-node split.
-    Returns (idx, address) or (None, None).
-    """
+    """MATURING non-master → inactive/seeded non-master. ⚠ TODO: see module docstring."""
     from .assess import _assess_state
     from .config import NODE_INDICES
-
     try:
         pw = ""
         try:
@@ -218,41 +208,29 @@ def _pick_target(master_idx: int) -> tuple:
             pw = get_password() or ""
         except Exception:
             pass
-
-        st = _assess_state(0, pw)
+        st    = _assess_state(0, pw)
         nodes = st.get("by_idx", {})
-
-        # Priority 1: maturing non-master
         for idx in NODE_INDICES:
             if idx == master_idx:
                 continue
-            node = nodes.get(idx, {})
-            if node.get("status") == "maturing":
-                addr = node.get("staking_address") or cfg(f"prov_{idx}_address") or ""
+            if nodes.get(idx, {}).get("status") == "maturing":
+                addr = nodes[idx].get("staking_address") or cfg(f"prov_{idx}_address") or ""
                 if addr:
                     return idx, addr
-
-        # Priority 2: inactive non-master
         for idx in NODE_INDICES:
             if idx == master_idx:
                 continue
-            node = nodes.get(idx, {})
-            if node.get("status") in ("inactive", "seeded"):
-                addr = node.get("staking_address") or cfg(f"prov_{idx}_address") or ""
+            if nodes.get(idx, {}).get("status") in ("inactive", "seeded"):
+                addr = nodes.get(idx, {}).get("staking_address") or cfg(f"prov_{idx}_address") or ""
                 if addr:
                     return idx, addr
-
     except Exception as e:
         _log(f"[events] _pick_target error: {e}")
-
     return None, None
 
 
-def _do_allocate(
-    idx: int, addr: str, amount_dusk: float,
-    deposit_block: int | None, tx_hash: str, depositor: str
-) -> None:
-    """Run stake-activate and log result."""
+def _do_allocate(idx: int, addr: str, amount_dusk: float, deposit_block: int | None) -> None:
+    """Fire stake-activate. Step 2 result comes from tx/executed event."""
     from .wallet import operator_cmd, get_password, WALLET_PATH
     from .config import _NET
 
@@ -260,18 +238,15 @@ def _do_allocate(
     amount_lux = int(amount_dusk * 1_000_000_000)
     t_start    = time.time()
 
-    # Track for activate confirmation timing
     with _pending_lock:
         _pending_activations[addr] = {
-            "deposit_ts":    _now_ts(),
             "wall_ts":       t_start,
             "amount_dusk":   amount_dusk,
             "deposit_block": deposit_block,
-            "tx_hash":       tx_hash,
             "prov_idx":      idx,
         }
 
-    r = operator_cmd(
+    operator_cmd(
         f"{_NET} pool stake-activate --skip-confirmation "
         f"--amount {amount_lux} "
         f"--provisioner {addr} "
@@ -279,82 +254,95 @@ def _do_allocate(
         f"--provisioner-password '{pw}'",
         timeout=120, password=pw,
     )
-
-    elapsed = round(time.time() - t_start, 1)
-
-    if r.get("ok"):
-        _dlog({
-            "type":     "deposit_allocated",
-            "msg":      (f"✓ stake-activate OK — prov[{idx}] "
-                         f"{amount_dusk:,.4f} DUSK in {elapsed}s "
-                         f"(block ~{deposit_block})"),
-            "prov_idx": idx,
-            "prov_addr": addr,
-            "amount":   amount_dusk,
-            "elapsed_s": elapsed,
-            "block":    deposit_block,
-            "ok":       True,
-        })
-    else:
-        err = r.get("stderr") or r.get("stdout") or "unknown error"
-        _dlog({
-            "type":     "deposit_failed",
-            "msg":      f"✗ stake-activate FAILED prov[{idx}]: {err}",
-            "prov_idx": idx,
-            "prov_addr": addr,
-            "amount":   amount_dusk,
-            "elapsed_s": elapsed,
-            "error":    err,
-            "ok":       False,
-        })
-
-
-# ── Activate confirmation handler ─────────────────────────────────────────────
-
-def _handle_activate(decoded: dict, block_height: int | None) -> None:
-    """
-    A stake_activate contract event confirmed on-chain.
-    Match back to pending allocation and report timing.
-    """
-    prov_addr = decoded.get("provisioner") or decoded.get("account") or ""
-    amount_lux = decoded.get("amount") or decoded.get("value") or 0
-    amount_dusk = float(amount_lux) / 1e9
-
-    with _pending_lock:
-        pending = _pending_activations.pop(prov_addr, None)
-
-    if pending:
-        elapsed = round(time.time() - pending["wall_ts"], 1)
-        _dlog({
-            "type":       "activate_confirmed",
-            "msg":        (f"✓ activate confirmed on-chain — prov ({prov_addr[:12]}…) "
-                           f"{amount_dusk:,.4f} DUSK "
-                           f"block #{block_height} "
-                           f"· {elapsed}s from deposit to activation"),
-            "prov_addr":  prov_addr,
-            "amount":     amount_dusk,
-            "block":      block_height,
-            "deposit_block": pending.get("deposit_block"),
-            "elapsed_s":  elapsed,
-            "ok":         True,
-        })
+    # Result logged by _handle_tx_executed when tx/executed event arrives
 
 
 def _handle_tx_executed(decoded: dict, block_height: int | None) -> None:
-    """
-    tx/executed — check if it's a failed stake-activate we care about.
-    """
+    """Step 2: tx/executed for stake_activate — win or loss."""
+    global _race_wins, _race_losses
     inner = decoded.get("inner") or decoded
     call  = inner.get("call") or {}
-    err   = decoded.get("err")
-    if err and call.get("fn_name") == "stake_activate":
-        prov_decoded = call.get("_fn_args_decoded") or {}
-        prov_addr    = (prov_decoded.get("keys") or {}).get("account") or ""
+    if call.get("fn_name") != "stake_activate":
+        return
+
+    prov_decoded = call.get("_fn_args_decoded") or {}
+    prov_addr    = (prov_decoded.get("keys") or {}).get("account") or ""
+    amount_lux   = int(str(prov_decoded.get("value") or 0))
+    amount_dusk  = amount_lux / 1e9
+    err          = decoded.get("err")
+    gas_spent    = decoded.get("gas_spent")
+    gas_limit    = (inner.get("fee") or {}).get("gas_limit")
+
+    own = _own_addresses()
+    if prov_addr and own and prov_addr not in own:
+        return
+
+    with _pending_lock:
+        pending = _pending_activations.get(prov_addr)
+    elapsed = round(time.time() - pending["wall_ts"], 1) if pending else None
+
+    if not err:
+        with _race_lock:
+            _race_wins += 1
+        wins, losses = _race_wins, _race_losses
         _dlog({
-            "type":    "activate_tx_failed",
-            "msg":     f"✗ stake_activate tx failed at block #{block_height}: {err}",
+            "type":      "tx_confirmed",
+            "step":      2,
+            "msg":       (f"✓ tx confirmed blk #{block_height}"
+                          + (f" · {elapsed}s" if elapsed else "")
+                          + f" · gas {gas_spent}/{gas_limit}"
+                          + f" · W{wins}/L{losses}"),
             "prov_addr": prov_addr,
-            "block":   block_height,
-            "error":   str(err),
-            "ok":      False,
+            "amount":    amount_dusk,
+            "block":     block_height,
+            "elapsed_s": elapsed,
+            "wins":      wins,
+            "losses":    losses,
+            "ok":        True,
         })
+    else:
+        with _race_lock:
+            _race_losses += 1
+        wins, losses = _race_wins, _race_losses
+        _dlog({
+            "type":      "tx_failed",
+            "step":      2,
+            "msg":       (f"✗ tx failed blk #{block_height}: {err}"
+                          + (f" · {elapsed}s" if elapsed else "")
+                          + f" · W{wins}/L{losses}"),
+            "prov_addr": prov_addr,
+            "amount":    amount_dusk,
+            "block":     block_height,
+            "elapsed_s": elapsed,
+            "error":     str(err),
+            "wins":      wins,
+            "losses":    losses,
+            "ok":        False,
+        })
+
+
+def _handle_activate(decoded: dict, block_height: int | None) -> None:
+    """Step 3: activate contract event — stake is now live on-chain."""
+    prov_addr   = decoded.get("provisioner") or decoded.get("account") or ""
+    amount_lux  = int(str(decoded.get("amount") or decoded.get("value") or 0))
+    amount_dusk = amount_lux / 1e9
+
+    own = _own_addresses()
+    if prov_addr and own and prov_addr not in own:
+        return
+
+    with _pending_lock:
+        pending = _pending_activations.pop(prov_addr, None)
+    elapsed = round(time.time() - pending["wall_ts"], 1) if pending else None
+
+    _dlog({
+        "type":      "activate_confirmed",
+        "step":      3,
+        "msg":       (f"✓ stake live on-chain blk #{block_height}"
+                      + (f" · {elapsed}s total" if elapsed else "")),
+        "prov_addr": prov_addr,
+        "amount":    amount_dusk,
+        "block":     block_height,
+        "elapsed_s": elapsed,
+        "ok":        True,
+    })
